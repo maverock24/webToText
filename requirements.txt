@@ -1,0 +1,7 @@
+
+## requirements.txt
+
+```text
+selenium>=4.9.0
+webdriver-manager>=3.8.6
+selenium-stealth>=1.0.6
