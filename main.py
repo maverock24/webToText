@@ -1,545 +1,952 @@
-import time
-import random
-import unicodedata
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+"""
+WebToText - A tool to extract text from web pages using Chrome Remote Debugging
+"""
+
+import subprocess
 import os
-import logging
 import sys
+import platform
+import time
+import json
+import re
+import logging
+import threading
+import random
 import tkinter as tk
-from tkinter import scrolledtext, ttk, filedialog, BooleanVar
-from threading import Thread
-from selenium import webdriver
-from selenium.webdriver.chrome.service import Service
-from selenium.webdriver.common.by import By
-from selenium.webdriver.chrome.options import Options
-from selenium.webdriver.support.ui import WebDriverWait
-from selenium.webdriver.support import expected_conditions as EC
-from selenium.common.exceptions import TimeoutException, NoSuchElementException
-from selenium.common.exceptions import ElementNotInteractableException, StaleElementReferenceException
-from selenium.common.exceptions import JavascriptException, WebDriverException
-from webdriver_manager.chrome import ChromeDriverManager
-from selenium_stealth import stealth
+from tkinter import ttk, scrolledtext, filedialog, messagebox
+from urllib.parse import urlparse
+import websocket
+import requests
+from datetime import datetime
 
 # Set up logging
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logging.basicConfig(level=logging.INFO,
+                   format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-# Keep existing functions unchanged
-def safe_execute_script(driver, script, default_return=None):
-    """Execute JavaScript safely with error handling."""
-    try:
-        return driver.execute_script(script)
-    except (JavascriptException, WebDriverException) as e:
-        logger.debug(f"JavaScript execution failed: {e}")
-        return default_return
-
-def dismiss_dialogs(driver, url, timeout=5):
-    """Attempt to dismiss common cookie banners and dialogs with improved error handling."""
-    try:
-        # Handle specific sites with known patterns
-        if "nytimes.com" in url:
+class ChromeRemoteDebugger:
+    """Class to interface with Chrome via the DevTools Protocol"""
+    
+    def __init__(self, host='localhost', port=9222):
+        """Initialize connection to Chrome"""
+        self.host = host
+        self.port = port
+        self.ws = None
+        self.tab_id = None
+        self.request_id = 0
+        
+    def connect(self):
+        """Connect to an existing Chrome instance with debugging enabled"""
+        try:
+            # Get available tabs
+            response = requests.get(f"http://{self.host}:{self.port}/json")
+            if response.status_code != 200:
+                return False, f"Failed to connect: {response.status_code}"
+            
+            tabs = response.json()
+            if not tabs:
+                return False, "No Chrome tabs found. Is Chrome running with --remote-debugging-port?"
+            
+            # Find a suitable tab or create a new one
+            for tab in tabs:
+                if 'webSocketDebuggerUrl' in tab and tab['type'] == 'page':
+                    self.tab_id = tab['id']
+                    ws_url = tab['webSocketDebuggerUrl']
+                    self.ws = websocket.create_connection(ws_url)
+                    return True, "Connected successfully"
+                    
+            # If no suitable tab found, create a new one
+            response = requests.get(f"http://{self.host}:{self.port}/json/new")
+            if response.status_code != 200:
+                return False, "Failed to create new tab"
+                
+            tab = response.json()
+            self.tab_id = tab['id']
+            ws_url = tab['webSocketDebuggerUrl']
+            self.ws = websocket.create_connection(ws_url)
+            return True, "Connected to new tab"
+            
+        except Exception as e:
+            return False, f"Connection error: {str(e)}"
+    
+    def navigate(self, url):
+        """Navigate to a URL"""
+        if not self.ws:
+            return False, "Not connected to Chrome"
+        
+        try:
+            self.request_id += 1
+            self.ws.send(json.dumps({
+                "id": self.request_id,
+                "method": "Page.navigate",
+                "params": {"url": url}
+            }))
+            
+            # Wait for navigation to complete
+            while True:
+                result = json.loads(self.ws.recv())
+                if 'id' in result and result['id'] == self.request_id:
+                    return True, "Navigation successful"
+                if 'method' in result and result['method'] == 'Page.loadEventFired':
+                    return True, "Page loaded"
+                    
+        except Exception as e:
+            return False, f"Navigation error: {str(e)}"
+    
+    def get_document(self):
+        """Get the document object"""
+        if not self.ws:
+            return None
+            
+        try:
+            # First get the document
+            self.request_id += 1
+            self.ws.send(json.dumps({
+                "id": self.request_id,
+                "method": "DOM.getDocument"
+            }))
+            
+            result = json.loads(self.ws.recv())
+            if 'result' in result and 'root' in result['result']:
+                return result['result']['root']
+            return None
+        except Exception as e:
+            logger.error(f"Error getting document: {e}")
+            return None
+    
+    def execute_script(self, script):
+        """Execute JavaScript in the page"""
+        if not self.ws:
+            return None
+            
+        try:
+            self.request_id += 1
+            self.ws.send(json.dumps({
+                "id": self.request_id,
+                "method": "Runtime.evaluate",
+                "params": {
+                    "expression": script,
+                    "returnByValue": True
+                }
+            }))
+            
+            result = json.loads(self.ws.recv())
+            if ('result' in result and 'result' in result['result'] and 
+                'value' in result['result']['result']):
+                return result['result']['result']['value']
+            return None
+        except Exception as e:
+            logger.error(f"Error executing script: {e}")
+            return None
+    
+    def extract_text_from_all_tabs(self):
+        """Extract text from all open tabs in Chrome"""
+        results = []
+        tabs = self.get_all_tabs()
+        
+        # Store current tab if we're connected
+        current_tab_id = self.tab_id
+        
+        for tab in tabs:
             try:
-                # Wait longer for NY Times site to fully load
-                time.sleep(5)
-                
-                # Check if any paywall/subscription dialogs exist before attempting to interact
-                safe_execute_script(driver, """
-                    // Remove subscription modals
-                    const modals = document.querySelectorAll('[data-testid="subscription-modal"], [data-testid="complianceBlocker"], [data-testid="onsite-messaging-unit"], .ReactModalPortal');
-                    if (modals) {
-                        modals.forEach(modal => {
-                            if (modal) modal.remove();
-                        });
-                    }
+                # Connect to this tab
+                if 'webSocketDebuggerUrl' not in tab:
+                    continue
                     
-                    // Make content visible and enable scrolling
-                    document.documentElement.style.overflow = 'auto';
-                    document.body.style.overflow = 'auto';
+                # Close existing connection if any
+                if self.ws:
+                    self.ws.close()
                     
-                    // Remove any fixed position overlays
-                    document.querySelectorAll('[style*="position:fixed"]').forEach(elem => {
-                        if (elem) elem.remove();
-                    });
-                """)
+                # Connect to the new tab
+                self.tab_id = tab['id']
+                self.ws = websocket.create_connection(tab['webSocketDebuggerUrl'])
                 
-                # Try to accept cookies if the button is present
-                buttons = driver.find_elements(By.XPATH, "//button[contains(., 'Accept')] | //button[contains(., 'Continue')] | //button[contains(., 'Agree')]")
-                for button in buttons:
-                    try:
-                        if button.is_displayed():
-                            safe_execute_script(driver, "arguments[0].click();", button)
-                            time.sleep(1)
-                    except Exception:
-                        pass
+                # Get tab URL and title
+                url = tab.get('url', 'Unknown URL')
+                title = tab.get('title', 'Untitled')
+                
+                # Extract text
+                text = self.extract_page_text()
+                
+                results.append({
+                    'url': url,
+                    'title': title,
+                    'text': text
+                })
                 
             except Exception as e:
-                logger.warning(f"NY Times specific handling failed: {e}")
+                logger.error(f"Error extracting text from tab {tab.get('id')}: {e}")
+                results.append({
+                    'url': tab.get('url', 'Unknown URL'),
+                    'title': tab.get('title', 'Untitled'),
+                    'text': f"Error extracting text: {str(e)}"
+                })
         
-        # Wait for page to load
-        time.sleep(3)
-        
-        # Common accept button text patterns
-        accept_patterns = [
-            "accept", "agree", "accept all", "allow", "got it", "i understand", 
-            "ok", "continue", "close", "consent", "accept cookies", "reject all"
-        ]
-        
-        # Try switching to iframes that might contain consent forms
-        iframes = driver.find_elements(By.TAG_NAME, "iframe")
-        
-        # First try without iframes
-        for pattern in accept_patterns:
+        # Reconnect to the original tab if possible
+        if current_tab_id:
             try:
-                xpath = f"//button[contains(translate(., 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), '{pattern}')] | " \
-                       f"//a[contains(translate(., 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), '{pattern}')] | " \
-                       f"//div[contains(translate(., 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), '{pattern}')]"
-                
-                elements = driver.find_elements(By.XPATH, xpath)
-                for element in elements:
-                    try:
-                        if element.is_displayed():
-                            # Use JavaScript click which is more reliable for overlays
-                            safe_execute_script(driver, "arguments[0].click();", element)
-                            time.sleep(1)
-                    except Exception:
-                        continue
-            except (ElementNotInteractableException, NoSuchElementException, StaleElementReferenceException):
-                continue
-        
-        # Then try with iframes
-        for iframe in iframes:
-            try:
-                driver.switch_to.frame(iframe)
-                for pattern in accept_patterns:
-                    try:
-                        xpath = f"//button[contains(translate(., 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), '{pattern}')] | " \
-                               f"//a[contains(translate(., 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), '{pattern}')]"
-                        
-                        elements = driver.find_elements(By.XPATH, xpath)
-                        for element in elements:
-                            try:
-                                if element.is_displayed():
-                                    safe_execute_script(driver, "arguments[0].click();", element)
-                                    time.sleep(1)
-                                    break
-                            except Exception:
-                                continue
-                    except Exception:
-                        continue
-                driver.switch_to.default_content()
+                for tab in tabs:
+                    if tab['id'] == current_tab_id and 'webSocketDebuggerUrl' in tab:
+                        self.ws = websocket.create_connection(tab['webSocketDebuggerUrl'])
+                        self.tab_id = current_tab_id
+                        break
             except Exception:
-                try:
-                    driver.switch_to.default_content()
-                except Exception:
-                    pass
-                continue
+                # If we can't reconnect to the original tab, just continue
+                pass
         
-        # Nuclear option: JavaScript to force remove overlays and enable scrolling
-        safe_execute_script(driver, """
-            try {
-                // Remove common overlay elements
-                const selectors = [
-                    '.modal', '.overlay', '.cookie-banner', '.cookie-dialog', '.cookie-modal', 
-                    '.gdpr-modal', '.consent-modal', '.privacy-overlay', '.privacy-popup',
-                    '[class*="cookie"]', '[class*="consent"]', '[class*="gdpr"]', '[id*="cookie"]',
-                    '[id*="consent"]', '[id*="gdpr"]', '[class*="popup"]', '[class*="modal"]',
-                    '[class*="overlay"]'
+        return results
+    
+    def save_all_tabs_to_file(self, results, output_dir="extracted_texts"):
+        """Save extracted text from all tabs to a single file."""
+        try:
+            # Create output directory if it doesn't exist
+            if not os.path.exists(output_dir):
+                os.makedirs(output_dir)
+            
+            # Create a filename with timestamp
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            filename = f"all_chrome_tabs_{timestamp}.md"
+            filepath = os.path.join(output_dir, filename)
+            
+            # Generate content with tab separators
+            content = f"# Chrome Tabs Content\nExtracted: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n"
+            
+            for i, result in enumerate(results, 1):
+                # Add a clear separator between tabs
+                content += f"## {i}. {result['title']}\n"
+                content += f"URL: {result['url']}\n\n"
+                content += result['text'] + "\n\n"
+                content += "---\n\n"  # Horizontal rule between tabs
+            
+            # Save the text
+            with open(filepath, "w", encoding="utf-8") as f:
+                f.write(content)
+            
+            return filepath
+        except Exception as e:
+            logger.error(f"Error saving all tabs to file: {e}")
+            return None
+    
+    def get_all_tabs(self):
+        """Get a list of all open tabs in Chrome"""
+        try:
+            # Get available tabs
+            response = requests.get(f"http://{self.host}:{self.port}/json")
+            if response.status_code != 200:
+                return []
+            
+            tabs = response.json()
+            
+            # Filter to include only page-type tabs (exclude devtools, extensions)
+            return [tab for tab in tabs if tab['type'] == 'page']
+        except Exception as e:
+            logger.error(f"Error getting tabs: {e}")
+            return []
+
+    def extract_page_text(self):
+        """Extract structured text from the current page optimized for Confluence content"""
+        script = """
+        (function() {
+            // Helper function to determine if element is visible
+            function isVisible(element) {
+                if (!element) return false;
+                const style = window.getComputedStyle(element);
+                return style.display !== 'none' && 
+                    style.visibility !== 'hidden' && 
+                    style.opacity !== '0' &&
+                    element.offsetWidth > 0 &&
+                    element.offsetHeight > 0;
+            }
+            
+            // Helper function to extract text with proper structure
+            function extractStructuredText(element) {
+                if (!element) return '';
+                
+                // Clone the element to avoid modifying the original DOM
+                const clone = element.cloneNode(true);
+                
+                // Remove unwanted elements
+                const selectorsToRemove = [
+                    'nav', 'header', '.aui-header', '#header', '.confluence-navigation',
+                    '.footer', 'footer', '#footer', '.ia-secondary-header', '.ia-secondary-content-sidebar',
+                    '.ads', '.advertisement', '.cookie', '.popup', '.modal',
+                    'iframe', 'script', 'style', 'noscript', '#navigation',
+                    '.hidden-content', '#likes-and-labels-container'
                 ];
                 
-                selectors.forEach(selector => {
-                    document.querySelectorAll(selector).forEach(elem => {
-                        if (elem) elem.remove();
+                selectorsToRemove.forEach(selector => {
+                    clone.querySelectorAll(selector).forEach(el => el.remove());
+                });
+                
+                // Extract Confluence page metadata if available
+                let metadata = '';
+                const title = document.querySelector('#title-text') || document.querySelector('h1.pagetitle');
+                if (title) {
+                    metadata += `# ${title.textContent.trim()}\\n\\n`;
+                }
+                
+                const breadcrumbs = document.querySelector('#breadcrumbs');
+                if (breadcrumbs) {
+                    metadata += `Path: ${breadcrumbs.textContent.replace(/\\s+/g, ' ').trim()}\\n\\n`;
+                }
+                
+                const pageInfo = document.querySelector('#page-metadata-info');
+                if (pageInfo) {
+                    metadata += `${pageInfo.textContent.replace(/\\s+/g, ' ').trim()}\\n\\n`;
+                }
+                
+                // Special handling for Confluence code blocks
+                clone.querySelectorAll('div.code, pre.syntaxhighlighter-pre, div.codeContent, div.syntaxhighlighter').forEach(codeBlock => {
+                    // Try to determine language from class
+                    let language = '';
+                    const classes = codeBlock.className.split(' ');
+                    for (const cls of classes) {
+                        if (cls.startsWith('brush:')) {
+                            language = cls.split(':')[1];
+                            break;
+                        } else if (['java', 'python', 'js', 'xml', 'sql', 'bash', 'shell', 'cpp', 'csharp'].includes(cls)) {
+                            language = cls;
+                            break;
+                        }
+                    }
+                    
+                    // Mark code blocks with backticks for Markdown
+                    codeBlock.textContent = '```' + language + '\\n' + codeBlock.textContent.trim() + '\\n```';
+                    
+                    // Preserve formatting by wrapping code blocks
+                    const wrapper = document.createElement('div');
+                    wrapper.className = 'preserved-code-block';
+                    codeBlock.parentNode.insertBefore(wrapper, codeBlock);
+                    wrapper.appendChild(codeBlock);
+                });
+                
+                // Handle Confluence panels (note, warning, info, etc.)
+                clone.querySelectorAll('.confluence-information-macro, .panel, .aui-message').forEach(panel => {
+                    let panelType = '';
+                    if (panel.classList.contains('confluence-information-macro-tip') || panel.classList.contains('aui-message-success')) {
+                        panelType = 'TIP:';
+                    } else if (panel.classList.contains('confluence-information-macro-note') || panel.classList.contains('aui-message-info')) {
+                        panelType = 'NOTE:';
+                    } else if (panel.classList.contains('confluence-information-macro-warning') || panel.classList.contains('aui-message-warning')) {
+                        panelType = 'WARNING:';
+                    } else if (panel.classList.contains('confluence-information-macro-error') || panel.classList.contains('aui-message-error')) {
+                        panelType = 'ERROR:';
+                    } else {
+                        panelType = 'INFO:';
+                    }
+                    
+                    // Insert panel type at the beginning
+                    const panelContent = panel.textContent.trim();
+                    panel.textContent = `> ${panelType} ${panelContent}`;
+                });
+                
+                // Handle Confluence status macros
+                clone.querySelectorAll('.status-macro').forEach(status => {
+                    const statusText = status.textContent.trim();
+                    const statusColor = status.classList.contains('status-green') ? 'SUCCESS' : 
+                                        status.classList.contains('status-red') ? 'FAILED' : 
+                                        status.classList.contains('status-yellow') ? 'WARNING' : 'INFO';
+                    status.textContent = `[STATUS: ${statusColor}] ${statusText}`;
+                });
+                
+                // Preserve heading structure with Markdown-style formatting
+                Array.from(clone.querySelectorAll('h1, h2, h3, h4, h5, h6')).forEach(heading => {
+                    const level = parseInt(heading.tagName[1]);
+                    const hashes = '#'.repeat(level);
+                    heading.textContent = `${hashes} ${heading.textContent.trim()}`;
+                    
+                    // Add extra line before headings
+                    const spacer = document.createElement('div');
+                    spacer.textContent = '\\n';
+                    heading.parentNode.insertBefore(spacer, heading);
+                });
+                
+                // Handle tables better for Confluence
+                clone.querySelectorAll('table.confluenceTable, table.aui').forEach(table => {
+                    const textTable = document.createElement('div');
+                    textTable.className = 'text-table';
+                    
+                    // Extract headers - Confluence specific
+                    const headers = Array.from(table.querySelectorAll('th')).map(th => th.textContent.trim());
+                    
+                    // Extract rows
+                    const rows = Array.from(table.querySelectorAll('tr')).map(tr => 
+                        Array.from(tr.querySelectorAll('td')).map(td => td.textContent.trim())
+                    ).filter(row => row.length > 0);
+                    
+                    // Create text representation
+                    let tableText = '\\n';
+                    if (headers.length > 0) {
+                        tableText += headers.join(' | ') + '\\n';
+                        tableText += headers.map(() => '---').join(' | ') + '\\n';
+                    }
+                    
+                    rows.forEach(row => {
+                        tableText += row.join(' | ') + '\\n';
+                    });
+                    
+                    textTable.textContent = tableText + '\\n';
+                    table.parentNode.replaceChild(textTable, table);
+                });
+                
+                // Handle Confluence lists (may have specific classes)
+                clone.querySelectorAll('ul.confluenceList, ol.confluenceList, ul, ol').forEach(list => {
+                    const items = list.querySelectorAll('li');
+                    Array.from(items).forEach((item, index) => {
+                        const isOrdered = list.tagName.toLowerCase() === 'ol';
+                        const marker = isOrdered ? `${index + 1}. ` : '- ';
+                        item.textContent = marker + item.textContent.trim();
                     });
                 });
                 
-                // Remove any fixed position elements at the top/bottom of the page
-                document.querySelectorAll('div[style*="position:fixed"], div[style*="position: fixed"]').forEach(elem => {
-                    if (elem) {
-                        const rect = elem.getBoundingClientRect();
-                        if ((rect.top <= 10 || window.innerHeight - rect.bottom <= 10) && 
-                            (rect.width > window.innerWidth * 0.5)) {
-                            elem.remove();
-                        }
-                    }
-                });
+                // Get the text content with preserved structure
+                let content = metadata + clone.innerText;
                 
-                // Enable scrolling by removing various no-scroll classes
-                const scrollClasses = ['no-scroll', 'modal-open', 'has-overlay', 'overflow-hidden'];
-                scrollClasses.forEach(className => {
-                    if (document.body.classList) {
-                        document.body.classList.remove(className);
-                    }
-                });
+                // Clean up excessive whitespace while preserving structure
+                content = content.replace(/\\n\\s*\\n\\s*\\n+/g, '\\n\\n');
                 
-                if (document.body.style) document.body.style.overflow = 'auto';
-                if (document.body.style) document.body.style.position = 'static';
-                if (document.documentElement.style) document.documentElement.style.overflow = 'auto';
-            } catch (e) {
-                // Silently fail if any JS errors
+                return content;
             }
-        """)
-        
-    except Exception as e:
-        logger.error(f"Dialog dismissal attempt failed: {e}")
-
-def fetch_text_from_url(url, callback=None):
-    """Fetch and clean ASCII text from a given URL with improved error handling."""
-    options = Options()
-    options.add_argument("--headless=new")  # Modern headless mode
-    options.add_argument("--disable-blink-features=AutomationControlled")
-    options.add_argument("--disable-gpu")
-    options.add_argument("--no-sandbox")
-    options.add_argument("--disable-dev-shm-usage")
-    options.add_argument("--lang=en-US,en;q=0.9")
-    options.add_argument("--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/110.0.0.0 Safari/537.36")
-    options.add_argument("--start-maximized")
-    options.add_experimental_option("excludeSwitches", ["enable-automation"])
-    options.add_experimental_option("useAutomationExtension", False)
-    
-    service = Service(ChromeDriverManager().install())
-    driver = webdriver.Chrome(service=service, options=options)
-    
-    # Apply stealth mode
-    stealth(driver,
-        languages=["en-US", "en"],
-        vendor="Google Inc.",
-        platform="Win32",
-        webgl_vendor="Intel Inc.",
-        renderer="Intel Iris OpenGL Engine",
-        fix_hairline=True,
-    )
-    
-    try:
-        logger.info(f"Fetching content from {url}")
-        if callback:
-            callback(f"Fetching content from {url}...")
-        
-        driver.get(url)
-        time.sleep(random.uniform(5, 7))  # Let JavaScript load content
-        
-        # Dismiss cookie banners and other dialogs
-        if callback:
-            callback(f"Dismissing dialogs on {url}...")
-        dismiss_dialogs(driver, url)
-        
-        # Allow a bit more time for everything to settle after dismissing dialogs
-        time.sleep(2)
-        
-        # Scroll down gradually to load lazy content, with error handling
-        try:
-            if callback:
-                callback(f"Scrolling page to load content...")
-                
-            height = safe_execute_script(driver, "return document.body.scrollHeight", 1000)
-            if height:
-                for i in range(1, 5):
-                    safe_execute_script(driver, f"window.scrollTo(0, {height * i / 5});")
-                    time.sleep(0.5)
-                safe_execute_script(driver, "window.scrollTo(0, 0);")  # Back to top
-        except Exception as e:
-            logger.warning(f"Scrolling failed: {e}")
-        
-        # Try to get just the main content if possible
-        if callback:
-            callback(f"Extracting main content...")
             
-        main_content = None
-        selectors = [
-            # Main content selectors in order of priority
-            'article', 'main', '.article-content', '.article-body', '.story-body',
-            '.content', '#content', '.main-content', '.post-content',
-            # News-specific selectors
-            '.article__body', '.entry-content', '.story', '.article__content',
-            # Generic content containers as fallback
-            '.container', '.page-content', '.page'
+            // Confluence-specific selectors to try first
+            const confluenceSelectors = [
+                '#main-content',
+                '#content',
+                '.wiki-content',
+                '.confluence-content',
+                '#main',
+                '.pageSection',
+                '#page-content',
+                '.aui-page-panel-content'
+            ];
+            
+            // Try Confluence selectors first
+            for (const selector of confluenceSelectors) {
+                const elements = document.querySelectorAll(selector);
+                for (const element of elements) {
+                    if (isVisible(element) && element.textContent.trim().length > 100) {
+                        return extractStructuredText(element);
+                    }
+                }
+            }
+            
+            // Fall back to generic selectors if Confluence selectors don't find anything
+            const genericSelectors = [
+                'article', 'main', '.article-content', '.article-body', 
+                '.content', '.main-content', '.post-content'
+            ];
+            
+            // Try each generic selector
+            for (const selector of genericSelectors) {
+                const elements = document.querySelectorAll(selector);
+                for (const element of elements) {
+                    if (isVisible(element) && element.textContent.trim().length > 200) {
+                        return extractStructuredText(element);
+                    }
+                }
+            }
+            
+            // If nothing found, try the document body
+            return extractStructuredText(document.body);
+        })();
+        """
+        
+        # Execute the script
+        result = self.execute_script(script)
+        
+        # Additional Python-side post-processing
+        if result:
+            # Clean up common leftover artifacts
+            result = self._post_process_text(result)
+        
+        return result or "No content could be extracted."
+    
+    def _post_process_text(self, text):
+        """
+        Post-process the extracted text to improve it for Confluence-based Copilot prompts
+        """
+        # Fix potential issues with code blocks
+        text = re.sub(r'```\s*```', '', text)  # Remove empty code blocks
+        
+        # Make sure code blocks have language hints when possible
+        code_block_patterns = {
+            r'```\s*function': '```javascript\nfunction',
+            r'```\s*def\s': '```python\ndef ',
+            r'```\s*import': '```python\nimport',
+            r'```\s*class\s': '```python\nclass ',
+            r'```\s*(public|private)\s': '```java\n\\1 ',
+            r'```\s*\<\?php': '```php\n<?php',
+            r'```\s*package\s': '```java\npackage ',
+            r'```\s*#include': '```cpp\n#include',
+            r'```\s*using namespace': '```cpp\nusing namespace',
+            r'```\s*const\s\w+\s=': '```javascript\nconst ',
+            r'```\s*var\s\w+\s=': '```javascript\nvar ',
+            r'```\s*let\s\w+\s=': '```javascript\nlet ',
+            r'```\s*SELECT\s': '```sql\nSELECT ',
+            r'```\s*<!DOCTYPE': '```html\n<!DOCTYPE',
+            r'```\s*<html': '```html\n<html',
+            # Confluence-specific code patterns
+            r'```\s*@': '```java\n@',      # Java annotations
+            r'```\s*---': '```yaml\n---',  # YAML frontmatter
+            r'```\s*apiVersion': '```yaml\napiVersion', # Kubernetes YAML
+            r'```\s*\<\?xml': '```xml\n<?xml'  # XML declarations
+        }
+        
+        for pattern, replacement in code_block_patterns.items():
+            text = re.sub(pattern, replacement, text, flags=re.IGNORECASE)
+        
+        # Fix confluence-specific formatting issues
+        text = re.sub(r'JIRA:\s*([A-Z]+-\d+)', r'JIRA: [\1]', text)  # Format JIRA references
+        text = re.sub(r'@([a-zA-Z0-9.-]+)', r'@\1', text)  # Preserve @ mentions
+        
+        # Clean up Confluence macro remnants
+        text = re.sub(r'\{[a-zA-Z]+(?:\:[a-zA-Z]+)?\}.*?\{[a-zA-Z]+\}', '', text)
+        
+        # Ensure documentation comments are formatted properly
+        text = re.sub(r'```\s*\/\*\*', '```java\n/**', text)
+        text = re.sub(r'```\s*\/\*', '```java\n/*', text)
+        text = re.sub(r'```\s*#', '```python\n#', text)
+        
+        # Handle Confluence's double dash that might be interpreted as strikethrough
+        text = re.sub(r'(\w)--(\w)', r'\1—\2', text)
+        
+        # Make sure lists are properly formatted
+        text = re.sub(r'\n\s*-\s+', '\n- ', text)
+        text = re.sub(r'\n\s*(\d+)\.\s+', '\n\\1. ', text)
+        
+        # Fix heading formatting
+        text = re.sub(r'([^#])\n#\s', '\\1\n\n# ', text)
+        text = re.sub(r'([^#])\n##\s', '\\1\n\n## ', text)
+        text = re.sub(r'([^#])\n###\s', '\\1\n\n### ', text)
+        
+        # Cleanup duplicated line breaks
+        text = re.sub(r'\n{3,}', '\n\n', text)
+        
+        # Add breaks between sections to improve readability
+        text = re.sub(r'(# .+)\n([^\n#])', '\\1\n\n\\2', text)
+        
+        return text
+    
+    def close(self):
+        """Close the connection"""
+        if self.ws:
+            try:
+                self.ws.close()
+            except:
+                pass
+            self.ws = None
+
+
+def launch_chrome_with_debugging(port=9222, user_data_dir=None):
+    """
+    Launch Google Chrome with remote debugging enabled.
+    
+    Args:
+        port (int): The port to use for remote debugging.
+        user_data_dir (str, optional): Path to Chrome user data directory.
+    
+    Returns:
+        subprocess.Popen: The process object for the launched Chrome instance.
+    """
+    # Determine the Chrome executable path based on platform
+    chrome_path = None
+    system = platform.system()
+    
+    if system == "Linux":
+        chrome_path = "google-chrome"
+    elif system == "Darwin":  # macOS
+        chrome_path = "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
+    elif system == "Windows":
+        # Check common installation paths on Windows
+        paths = [
+            os.path.join(os.environ.get('PROGRAMFILES(X86)', ''), 'Google/Chrome/Application/chrome.exe'),
+            os.path.join(os.environ.get('PROGRAMFILES', ''), 'Google/Chrome/Application/chrome.exe'),
+            os.path.join(os.environ.get('LOCALAPPDATA', ''), 'Google/Chrome/Application/chrome.exe')
         ]
-        
-        for selector in selectors:
-            try:
-                elements = driver.find_elements(By.CSS_SELECTOR, selector)
-                for element in elements:
-                    try:
-                        if element.is_displayed() and element.text and len(element.text.strip()) > 200:
-                            main_content = element.text
-                            break
-                    except Exception:
-                        continue
-                if main_content:
-                    break
-            except Exception:
-                continue
-        
-        # Fall back to body if no main content found or if it's too short
-        if not main_content or len(main_content.strip()) < 200:
-            try:
-                main_content = driver.find_element(By.TAG_NAME, "body").text
-            except Exception as e:
-                logger.error(f"Failed to get body text: {e}")
-                return f"Error extracting text from {url}: {e}"
-        
-        # Clean the text
-        if main_content:
-            if callback:
-                callback(f"Cleaning and processing text...")
-                
-            ascii_text = unicodedata.normalize('NFKD', main_content).encode('ascii', 'ignore').decode('ascii')
-            
-            # Additional cleaning to remove common noise
-            lines = ascii_text.split('\n')
-            filtered_lines = []
-            
-            for line in lines:
-                line = line.strip()
-                # Skip very short lines, navigational elements, etc.
-                if (len(line) > 3 and 
-                    not line.startswith('Search') and 
-                    not line.lower().startswith('sign in') and
-                    not line.lower().startswith('log in') and
-                    not line.lower().startswith('subscribe') and
-                    not 'cookie' in line.lower()):
-                    filtered_lines.append(line)
-            
-            return '\n'.join(filtered_lines)
-        else:
-            return f"No content could be extracted from {url}"
-    except Exception as e:
-        logger.error(f"Error fetching {url}: {e}")
-        return f"Error fetching {url}: {e}"
-    finally:
-        try:
-            driver.quit()
-        except Exception:
-            pass
-
-def save_text_to_file(url, text, output_dir="extracted_texts"):
-    """Save extracted text to a file."""
+        for path in paths:
+            if os.path.exists(path):
+                chrome_path = path
+                break
+    
+    if chrome_path is None:
+        raise FileNotFoundError("Could not find Google Chrome executable. Please install Chrome.")
+    
+    # Set up command line arguments
+    cmd = [chrome_path, 
+           f"--remote-debugging-port={port}",
+           "--remote-allow-origins=*"  # Add this flag to allow all origins
+          ]
+    
+    # Add user data directory if specified
+    if user_data_dir:
+        cmd.append(f"--user-data-dir={user_data_dir}")
+    else:
+        # Create a temporary user data directory to avoid conflicts
+        temp_dir = os.path.join(os.path.expanduser("~"), ".chrome_automation")
+        os.makedirs(temp_dir, exist_ok=True)
+        cmd.append(f"--user-data-dir={temp_dir}")
+    
+    # Add other useful flags
+    cmd.extend([
+        "--no-first-run",
+        "--no-default-browser-check",
+        "--start-maximized"
+    ])
+    
+    # Launch Chrome
     try:
-        # Create output directory if it doesn't exist
-        if not os.path.exists(output_dir):
-            os.makedirs(output_dir)
-        
-        # Create a valid filename from the URL
-        from urllib.parse import urlparse
-        parsed_url = urlparse(url)
-        domain = parsed_url.netloc.replace("www.", "")
-        filename = f"{domain.replace('.', '_')}.txt"
-        filepath = os.path.join(output_dir, filename)
-        
-        # Save the text
-        with open(filepath, "w", encoding="utf-8") as f:
-            f.write(text)
-        
-        return filepath
+        process = subprocess.Popen(cmd)
+        print(f"Chrome launched with remote debugging at port {port}")
+        # Give Chrome a moment to start up
+        time.sleep(2)
+        return process
     except Exception as e:
-        logger.error(f"Error saving text to file: {e}")
+        print(f"Error launching Chrome: {e}")
         return None
 
-# Fixed WebToTextGUI class - removing duplicates and drag-and-drop functionality
+
+    def save_text_to_file(self, url, text, output_dir="extracted_texts"):
+        """Save extracted text to a file in a format optimal for Confluence pages."""
+        try:
+            # Create output directory if it doesn't exist
+            if not os.path.exists(output_dir):
+                os.makedirs(output_dir)
+            
+            # Create a more descriptive filename from the URL
+            parsed_url = urlparse(url)
+            domain = parsed_url.netloc.replace("www.", "")
+            
+            # For Confluence URLs, extract space and page name
+            path_parts = parsed_url.path.strip("/").split("/")
+            if "confluence" in domain:
+                # Try to identify Confluence page structure
+                # Typical format: /display/SPACE/Page+Name or /wiki/spaces/SPACE/pages/123456/Page+Name
+                space_name = "unknown"
+                page_name = "page"
+                
+                if "display" in path_parts:
+                    display_index = path_parts.index("display")
+                    if len(path_parts) > display_index + 2:
+                        space_name = path_parts[display_index + 1]
+                        page_name = path_parts[display_index + 2].replace("+", "_")
+                elif "spaces" in path_parts:
+                    spaces_index = path_parts.index("spaces")
+                    if len(path_parts) > spaces_index + 1:
+                        space_name = path_parts[spaces_index + 1]
+                        # Find the page name after "pages" segment
+                        if "pages" in path_parts[spaces_index:]:
+                            pages_index = path_parts.index("pages", spaces_index)
+                            if len(path_parts) > pages_index + 2:
+                                page_name = path_parts[-1].replace("+", "_")
+                
+                # Use space and page name in filename
+                filename = f"confluence_{space_name}_{page_name}.md"
+            else:
+                # For non-Confluence URLs
+                path = parsed_url.path.strip("/").replace("/", "_")
+                if not path:
+                    path = "home"
+                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                filename = f"{domain}_{path}_{timestamp}.md"
+            
+            # Ensure valid filename
+            filename = re.sub(r'[\\/*?:"<>|]', "_", filename)
+            filepath = os.path.join(output_dir, filename)
+            
+            # Add a header with metadata for better context
+            header = f"""# Content from {url}
+    Extracted: {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}
+    Source: {domain}{parsed_url.path}
+
+    """
+            # Save the text with the header
+            with open(filepath, "w", encoding="utf-8") as f:
+                f.write(header + text)
+            
+            return filepath
+        except Exception as e:
+            logger.error(f"Error saving text to file: {e}")
+            return None
+
+
 class WebToTextGUI:
     def __init__(self, root):
+        """Initialize the GUI"""
         self.root = root
-        self.root.title("Web To Text - URL Scraper")
+        self.root.title("WebToText - URL Text Extractor")
         self.root.geometry("800x700")
+        
+        # Chrome process and debugger
+        self.chrome_process = None
+        self.debugger = None
         
         # Configure styles
         style = ttk.Style()
-        style.configure("TButton", padding=6, relief="flat", background="#ccc")
-        style.configure("TFrame", background="#f0f0f0")
-        style.configure("TLabel", background="#f0f0f0", font=('Arial', 10))
+        style.configure("TButton", padding=6)
         
-        # Main frame
+        # Main layout frame
         main_frame = ttk.Frame(root, padding="10")
         main_frame.pack(fill=tk.BOTH, expand=True)
         
+        # Chrome control section
+        chrome_frame = ttk.LabelFrame(main_frame, text="Chrome Control", padding="5")
+        chrome_frame.pack(fill=tk.X, pady=5)
+        
+        self.port_var = tk.StringVar(value="9222")
+        ttk.Label(chrome_frame, text="Debug Port:").pack(side=tk.LEFT, padx=5)
+        ttk.Entry(chrome_frame, textvariable=self.port_var, width=6).pack(side=tk.LEFT, padx=5)
+        
+        self.chrome_btn = ttk.Button(chrome_frame, text="Start Chrome", command=self.toggle_chrome)
+        self.chrome_btn.pack(side=tk.LEFT, padx=5)
+        
+        self.connect_btn = ttk.Button(chrome_frame, text="Connect to Chrome", command=self.connect_to_chrome)
+        self.connect_btn.pack(side=tk.LEFT, padx=5)
+        
+        self.status_var = tk.StringVar(value="Not connected")
+        ttk.Label(chrome_frame, textvariable=self.status_var).pack(side=tk.RIGHT, padx=5)
+        
         # URL input section
-        ttk.Label(main_frame, text="Enter URLs (one per line):").pack(anchor=tk.W, pady=(0, 5))
+        ttk.Label(main_frame, text="Enter URL:").pack(anchor=tk.W, pady=(10, 5))
         
-        self.url_input = scrolledtext.ScrolledText(main_frame, height=10)
-        self.url_input.pack(fill=tk.BOTH, expand=False, pady=(0, 10))
+        url_frame = ttk.Frame(main_frame)
+        url_frame.pack(fill=tk.X, pady=5)
         
-        # Add paste button for convenience
-        paste_button = ttk.Button(main_frame, text="Paste URL", command=self.paste_url)
-        paste_button.pack(anchor=tk.W, pady=(0, 10))
+        self.url_var = tk.StringVar()
+        url_entry = ttk.Entry(url_frame, textvariable=self.url_var)
+        url_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 5))
         
-        # Control panel frame
-        control_frame = ttk.Frame(main_frame)
-        control_frame.pack(fill=tk.X, pady=10)
+        ttk.Button(url_frame, text="Extract", command=self.extract_text).pack(side=tk.RIGHT)
         
-        # Save to file checkbox
-        self.save_to_file = BooleanVar()
-        self.save_to_file.set(True)
-        save_check = ttk.Checkbutton(control_frame, text="Save to files", variable=self.save_to_file)
-        save_check.pack(side=tk.LEFT, padx=(0, 10))
+        # Options frame
+        options_frame = ttk.Frame(main_frame)
+        options_frame.pack(fill=tk.X, pady=5)
         
-        # Output directory button
+        self.save_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(options_frame, text="Save to file", variable=self.save_var).pack(side=tk.LEFT)
+        
         self.output_dir = tk.StringVar(value="extracted_texts")
-        ttk.Button(control_frame, text="Output Directory", command=self.select_output_dir).pack(side=tk.LEFT, padx=(0, 10))
-        
-        # Scrape button
-        self.scrape_btn = ttk.Button(control_frame, text="Scrape URLs", command=self.start_scraping)
-        self.scrape_btn.pack(side=tk.LEFT, padx=(0, 10))
-        
-        # Clear button
-        ttk.Button(control_frame, text="Clear All", command=self.clear_all).pack(side=tk.LEFT)
-        
-        # Status label
-        self.status_var = tk.StringVar(value="Ready")
-        status_label = ttk.Label(main_frame, textvariable=self.status_var)
-        status_label.pack(fill=tk.X, pady=(5, 10))
+        ttk.Button(options_frame, text="Output Directory", 
+                  command=self.select_output_dir).pack(side=tk.LEFT, padx=10)
         
         # Results section
-        ttk.Label(main_frame, text="Results:").pack(anchor=tk.W, pady=(0, 5))
+        ttk.Label(main_frame, text="Extracted Text:").pack(anchor=tk.W, pady=(10, 5))
         
         self.results_text = scrolledtext.ScrolledText(main_frame, height=20)
-        self.results_text.pack(fill=tk.BOTH, expand=True)
-        self.results_text.config(state=tk.DISABLED)
+        self.results_text.pack(fill=tk.BOTH, expand=True, pady=5)
+        self.results_text.config(wrap=tk.WORD)
+
+        # Add to the options_frame section:
+        self.all_tabs_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(options_frame, text="Extract All Tabs", 
+                variable=self.all_tabs_var).pack(side=tk.LEFT, padx=10)
         
-        # Add keyboard shortcut for pasting (Ctrl+V)
-        self.root.bind("<Control-v>", lambda e: self.paste_url())
+        # Bottom buttons
+        bottom_frame = ttk.Frame(main_frame)
+        bottom_frame.pack(fill=tk.X, pady=10)
+        
+        ttk.Button(bottom_frame, text="Clear", command=self.clear_text).pack(side=tk.LEFT)
+        ttk.Button(bottom_frame, text="Help", 
+                  command=self.show_help).pack(side=tk.RIGHT)
+        
+        # Bind window close event
+        self.root.protocol("WM_DELETE_WINDOW", self.on_closing)
     
-    def paste_url(self):
-        """Paste URL from clipboard"""
-        try:
-            clipboard = self.root.clipboard_get()
-            if clipboard.strip().startswith('http'):
-                current_text = self.url_input.get(1.0, tk.END)
-                if current_text.strip():
-                    # If there's already text, add a newline first
-                    self.url_input.insert(tk.END, "\n" + clipboard)
+    def toggle_chrome(self):
+        """Start or stop Chrome process"""
+        if self.chrome_process:
+            self.chrome_process.terminate()
+            self.chrome_process = None
+            self.chrome_btn.config(text="Start Chrome")
+            self.status_var.set("Chrome stopped")
+            if self.debugger:
+                self.debugger.close()
+                self.debugger = None
+        else:
+            try:
+                port = int(self.port_var.get())
+                self.chrome_process = launch_chrome_with_debugging(port=port)
+                if self.chrome_process:
+                    self.chrome_btn.config(text="Stop Chrome")
+                    self.status_var.set(f"Chrome started on port {port}")
                 else:
-                    self.url_input.insert(tk.END, clipboard)
-                self.status_var.set("URL pasted from clipboard")
-            else:
-                self.status_var.set("Clipboard content is not a URL")
-        except Exception as e:
-            self.status_var.set(f"Failed to paste: {e}")
+                    self.status_var.set("Failed to start Chrome")
+            except ValueError:
+                messagebox.showerror("Invalid Port", "Please enter a valid port number")
     
+    def connect_to_chrome(self):
+        """Connect to running Chrome instance"""
+        try:
+            port = int(self.port_var.get())
+            if self.debugger:
+                self.debugger.close()
+            
+            self.debugger = ChromeRemoteDebugger(port=port)
+            success, message = self.debugger.connect()
+            
+            if success:
+                self.status_var.set(f"Connected to Chrome (port {port})")
+            else:
+                self.status_var.set(message)
+                self.debugger = None
+                messagebox.showerror("Connection Error", message)
+        except ValueError:
+            messagebox.showerror("Invalid Port", "Please enter a valid port number")
+    
+    def extract_text(self):
+        """Extract text from the specified URL or all tabs"""
+        if not self.debugger:
+            # Try to connect first
+            self.connect_to_chrome()
+            if not self.debugger:
+                messagebox.showerror("Not Connected", 
+                                    "Not connected to Chrome. Please start Chrome and connect first.")
+                return
+        
+        # Clear previous results
+        self.clear_text()
+        
+        # Check if we're in all-tabs mode
+        if self.all_tabs_var.get():
+            self.results_text.insert(tk.END, "Extracting text from all open Chrome tabs...\n\n")
+            self.root.update_idletasks()
+            
+            # Process all tabs in a separate thread
+            def extract_all_thread():
+                try:
+                    # Extract text from all tabs
+                    results = self.debugger.extract_text_from_all_tabs()
+                    
+                    if not results:
+                        self.results_text.delete(1.0, tk.END)
+                        self.results_text.insert(tk.END, "No open tabs found or error getting tabs.\n")
+                        return
+                    
+                    # Display summary
+                    self.results_text.delete(1.0, tk.END)
+                    self.results_text.insert(tk.END, f"Extracted text from {len(results)} tabs.\n\n")
+                    
+                    for i, result in enumerate(results, 1):
+                        self.results_text.insert(tk.END, f"{i}. {result['title']} ({result['url']})\n")
+                    
+                    # Save to file if requested
+                    if self.save_var.get():
+                        filepath = self.debugger.save_all_tabs_to_file(results, self.output_dir.get())
+                        if filepath:
+                            self.results_text.insert(tk.END, f"\n\n--- Saved all tabs to {filepath} ---")
+                
+                except Exception as e:
+                    self.results_text.insert(tk.END, f"Error: {str(e)}\n")
+            
+            threading.Thread(target=extract_all_thread, daemon=True).start()
+        else:
+            # Original single-URL extraction code
+            url = self.url_var.get().strip()
+            if not url:
+                messagebox.showinfo("No URL", "Please enter a URL to extract text from.")
+                return
+            
+            # Add http:// if not present
+            if not url.startswith('http'):
+                url = 'https://' + url
+                self.url_var.set(url)
+            
+            self.results_text.insert(tk.END, f"Extracting text from {url}...\n\n")
+            self.root.update_idletasks()
+            
+            # Process in a separate thread
+            def extract_thread():
+                try:
+                    # Navigate to URL
+                    success, message = self.debugger.navigate(url)
+                    if not success:
+                        self.results_text.insert(tk.END, f"Error: {message}\n")
+                        return
+                    
+                    # Wait a bit for page to load
+                    time.sleep(2)
+                    
+                    # Extract text
+                    text = self.debugger.extract_page_text()
+                    
+                    # Display the text
+                    self.results_text.delete(1.0, tk.END)
+                    self.results_text.insert(tk.END, text)
+                    
+                    # Save to file if requested
+                    if self.save_var.get():
+                        filepath = self.debugger.save_text_to_file(url, text, self.output_dir.get())
+                        if filepath:
+                            self.results_text.insert(tk.END, f"\n\n--- Saved to {filepath} ---")
+                
+                except Exception as e:
+                    self.results_text.insert(tk.END, f"Error: {str(e)}\n")
+            
+            threading.Thread(target=extract_thread, daemon=True).start()
+        
     def select_output_dir(self):
+        """Select output directory for saved files"""
         directory = filedialog.askdirectory(initialdir=self.output_dir.get())
         if directory:
             self.output_dir.set(directory)
-            self.status_var.set(f"Output directory: {directory}")
     
-    def clear_all(self):
-        self.url_input.delete(1.0, tk.END)
-        self.results_text.config(state=tk.NORMAL)
+    def clear_text(self):
+        """Clear the results text area"""
         self.results_text.delete(1.0, tk.END)
-        self.results_text.config(state=tk.DISABLED)
-        self.status_var.set("Ready")
     
-    def update_results(self, text):
-        self.results_text.config(state=tk.NORMAL)
-        self.results_text.insert(tk.END, text + "\n")
-        self.results_text.see(tk.END)  # Auto-scroll to the latest output
-        self.results_text.config(state=tk.DISABLED)
-        self.root.update_idletasks()  # Force GUI update
+    def show_help(self):
+        """Show help information"""
+        help_text = """WebToText Help
+
+    1. Starting Chrome:
+    - Click "Start Chrome" to launch Chrome with remote debugging
+    - Or start Chrome manually with: 
+        google-chrome --remote-debugging-port=9222 --remote-allow-origins=*
     
-    def update_status(self, status):
-        self.status_var.set(status)
-        self.root.update_idletasks()
+    2. Connecting:
+    - Click "Connect to Chrome" to connect to the running instance
+    - Ensure the port number matches (default: 9222)
     
-    def start_scraping(self):
-        # Disable the scrape button
-        self.scrape_btn.config(state=tk.DISABLED)
-        
-        # Get URLs from input field
-        url_text = self.url_input.get(1.0, tk.END).strip()
-        urls = [url.strip() for url in url_text.split('\n') if url.strip().startswith('http')]
-        
-        if not urls:
-            self.update_status("No valid URLs found. Please enter URLs starting with http:// or https://")
-            self.scrape_btn.config(state=tk.NORMAL)
-            return
-        
-        # Clear previous results
-        self.results_text.config(state=tk.NORMAL)
-        self.results_text.delete(1.0, tk.END)
-        self.results_text.config(state=tk.DISABLED)
-        
-        # Start a worker thread to handle the scraping
-        worker_thread = Thread(target=self.scrape_worker, args=(urls,))
-        worker_thread.daemon = True
-        worker_thread.start()
+    3. Extracting Text:
+    - Single Page: Enter a URL and click "Extract"
+    - All Open Tabs: Check "Extract All Tabs" and click "Extract"
     
-    def scrape_worker(self, urls):
-        try:
-            self.update_status(f"Processing {len(urls)} URLs...")
-            
-            for url in urls:
-                self.update_results(f"\n=== Content from {url} ===\n")
-                
-                # Fetch text content
-                text = fetch_text_from_url(url, callback=self.update_status)
-                self.update_results(text)
-                
-                # Save to file if requested
-                if self.save_to_file.get():
-                    filepath = save_text_to_file(url, text, self.output_dir.get())
-                    if filepath:
-                        self.update_results(f"\nText saved to: {filepath}")
-                
-                self.update_results("\n" + "-" * 80 + "\n")
-                
-                # Random delay to reduce chances of being blocked
-                delay = random.uniform(1, 3)  # Shorter delay for GUI application
-                self.update_status(f"Waiting {delay:.1f} seconds before next URL...")
-                time.sleep(delay)
-            
-            self.update_status("Scraping completed!")
-        except Exception as e:
-            logger.error(f"Error in scrape worker: {e}")
-            self.update_status(f"Error: {e}")
-        finally:
-            # Re-enable the scrape button
-            self.scrape_btn.config(state=tk.NORMAL)
+    4. Saving:
+    - Check "Save to file" to save extracted text
+    - For single URLs, saves to individual files
+    - For all tabs, saves to a single file with clear separators
+    - Click "Output Directory" to change where files are saved
+    
+    Note: Starting Chrome through this app creates a separate profile.
+    For using existing logins, start Chrome manually with the remote debugging flag.
+    """
+        messagebox.showinfo("WebToText Help", help_text)
+    
+    def on_closing(self):
+        """Handle window closing event"""
+        if self.chrome_process:
+            self.chrome_process.terminate()
+        if self.debugger:
+            self.debugger.close()
+        self.root.destroy()
+
 
 def main():
-    """Main function that starts the GUI or falls back to CLI if --no-gui is provided."""
-    if "--no-gui" in sys.argv:
-        # Command-line interface version
-        urls = []
-        
-        print("Enter URLs (type 'done' when finished):")
-        while True:
-            url = input("URL: ").strip()
-            if url.lower() == 'done':
-                break
-            urls.append(url)
-        
-        if not urls:
-            print("No URLs provided. Exiting.")
-            return
-        
-        save_to_file = input("Save extracted text to files? (y/n): ").strip().lower() == 'y'
-        output_dir = "extracted_texts"
-        
-        print("\nExtracted ASCII text from pages:")
-        for url in urls:
-            print(f"\n=== Content from {url} ===\n")
-            text = fetch_text_from_url(url)
-            print(text)
-            
-            if save_to_file:
-                filepath = save_text_to_file(url, text, output_dir)
-                if filepath:
-                    print(f"\nText saved to: {filepath}")
-            
-            print("\n" + "-" * 80 + "\n")
-            
-            # Random delay to reduce chances of being blocked
-            time.sleep(random.uniform(5, 10))
-    else:
-        # GUI version
-        try:
-            root = tk.Tk()
-            app = WebToTextGUI(root)
-            root.mainloop()
-        except Exception as e:
-            logger.error(f"Failed to start GUI: {e}")
-            print(f"Error starting GUI: {e}")
-            print("Falling back to command line mode. Use '--no-gui' flag to run in command line mode.")
-            print("Example: python main.py --no-gui")
-            # Don't call main() again to avoid infinite recursion
-            sys.exit(1)
+    # Check for required packages
+    try:
+        import websocket
+        import requests
+    except ImportError:
+        print("Required packages not found. Please install them with:")
+        print("pip install websocket-client requests")
+        sys.exit(1)
+    
+    root = tk.Tk()
+    app = WebToTextGUI(root)
+    root.mainloop()
+
 
 if __name__ == "__main__":
     main()

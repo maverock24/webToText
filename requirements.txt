@@ -1,7 +1,8 @@
+## WebToText Requirements
 
-## requirements.txt
+# Core dependencies
+websocket-client>=1.6.0
+requests>=2.31.0
 
-```text
-selenium>=4.9.0
-webdriver-manager>=3.8.6
-selenium-stealth>=1.0.6
+# Optional dependencies
+pyperclip>=1.8.2  # For clipboard operations

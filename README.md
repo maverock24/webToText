@@ -1,15 +1,25 @@
 # WebToText
 
-A versatile web scraping tool that extracts readable text content from websites and saves it as plain ASCII text.
+A versatile text extraction tool that connects to Chrome's DevTools Protocol to extract readable content from websites and save it in formatted text or markdown.
 
 ## Features
 
-- Extract main content from webpages while avoiding ads and navigation elements
-- Bypass cookie consent dialogs and subscription overlays automatically
-- Special handling for news sites with paywalls
+- Extract main content from webpages while filtering out ads and navigation elements
+- Special handling for Confluence pages with proper formatting of code blocks, tables, and panels
+- Extract text from all open Chrome tabs with a single click
 - User-friendly GUI for easy URL input and viewing results
-- Save extracted text to files for later reference
-- Command-line interface also available for automation
+- Save extracted text to markdown files for optimal readability
+- Advanced formatting preservation for code blocks, headings, and lists
+- Optimized output for use with GitHub Copilot and other AI tools
+
+## Requirements
+
+- Python 3.6+
+- Google Chrome browser
+- Required Python packages:
+  - websocket-client>=1.6.0
+  - requests>=2.31.0
+  - pyperclip>=1.8.2 (optional, for clipboard operations)
 
 ## Installation
 
@@ -17,6 +27,3 @@ A versatile web scraping tool that extracts readable text content from websites 
 ```bash
 git clone https://github.com/yourusername/webToText.git
 cd webToText
-
-2. Install requirements
-pip3 install -r requirements.txt
