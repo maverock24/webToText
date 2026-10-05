@@ -1,0 +1,8 @@
+# Ignore local build and editor artifacts
+
+# Local secrets and machine-specific files - never commit real values
+.env
+.env.*
+!.env.example
+*.keystore
+*.jks
